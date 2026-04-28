@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from telethon import events, utils
 
 from .config import load_settings
+from .dashboard import start_dashboard
 from .matcher import Matcher, TransientAIError
 from .profile import load_profile
 from .publisher import post_match
@@ -53,6 +54,14 @@ async def _run() -> None:
     source_entities = await resolve_sources(client, settings.sources)
     log.info("Monitoring %d sources; target=%s; threshold=%d", len(source_entities), settings.target_channel, settings.threshold)
 
+    for entity in source_entities:
+        chat_id = utils.get_peer_id(entity)
+        username = getattr(entity, "username", None)
+        title = getattr(entity, "title", None) or username or str(chat_id)
+        storage.register_channel(chat_id, username, title)
+
+    await start_dashboard(storage, settings.threshold)
+
     # Validate target is reachable.
     try:
         target_entity = await client.get_entity(settings.target_channel)
@@ -70,7 +79,7 @@ async def _run() -> None:
 
         if len(text) < MIN_TEXT_LEN or not _HAS_LETTER.search(text):
             log.info("too_short_skip chat=%s msg=%s len=%d", chat_id, msg_id, len(text))
-            storage.mark_seen(chat_id, msg_id, score=None, posted=False)
+            storage.record_message(chat_id, msg_id, is_vacancy=False, score=None, posted=False)
             return
 
         try:
@@ -80,12 +89,12 @@ async def _run() -> None:
             return
         except Exception as e:
             log.exception("matcher crashed on chat=%s msg=%s: %s", chat_id, msg_id, e)
-            storage.mark_seen(chat_id, msg_id, score=None, posted=False)
+            storage.record_message(chat_id, msg_id, score=None, posted=False)
             return
 
         if not result.is_vacancy:
             log.info("not_vacancy chat=%s msg=%s", chat_id, msg_id)
-            storage.mark_seen(chat_id, msg_id, score=result.match_score, posted=False)
+            storage.record_message(chat_id, msg_id, is_vacancy=False, score=result.match_score, posted=False)
             return
 
         posted = False
@@ -100,7 +109,9 @@ async def _run() -> None:
             "evaluated chat=%s msg=%s score=%d posted=%s title=%r",
             chat_id, msg_id, result.match_score, posted, result.title,
         )
-        storage.mark_seen(chat_id, msg_id, score=result.match_score, posted=posted)
+        storage.record_message(
+            chat_id, msg_id, is_vacancy=True, score=result.match_score, posted=posted, title=result.title,
+        )
 
     @client.on(events.NewMessage(chats=source_entities))
     async def handler(event):
