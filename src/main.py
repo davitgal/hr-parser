@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+from datetime import datetime, timedelta, timezone
 
-from telethon import events
+from telethon import events, utils
 
 from .config import load_settings
 from .matcher import Matcher, TransientAIError
@@ -59,25 +61,21 @@ async def _run() -> None:
         log.error("Could not resolve TARGET_CHANNEL_ID=%r: %s", settings.target_channel, e)
         raise
 
-    @client.on(events.NewMessage(chats=source_entities))
-    async def handler(event):
-        chat_id = event.chat_id
-        msg_id = event.id
-        text = (event.message.message or "").strip()
-        chat_title = _chat_title(event)
+    async def process_message(chat_id, msg_id, text, chat_title, *, source: str):
+        log.info("incoming src=%s chat=%s msg=%s len=%d title=%r", source, chat_id, msg_id, len(text), chat_title)
 
         if storage.seen(chat_id, msg_id):
-            log.debug("dedup skip chat=%s msg=%s", chat_id, msg_id)
+            log.info("dedup_skip chat=%s msg=%s", chat_id, msg_id)
             return
 
         if len(text) < MIN_TEXT_LEN or not _HAS_LETTER.search(text):
+            log.info("too_short_skip chat=%s msg=%s len=%d", chat_id, msg_id, len(text))
             storage.mark_seen(chat_id, msg_id, score=None, posted=False)
             return
 
         try:
             result = await matcher.evaluate(chat_title, text)
         except TransientAIError as e:
-            # Do NOT mark seen — retry on next restart / next message.
             log.error("AI transient failure, not marking seen: %s", e)
             return
         except Exception as e:
@@ -103,6 +101,28 @@ async def _run() -> None:
             chat_id, msg_id, result.match_score, posted, result.title,
         )
         storage.mark_seen(chat_id, msg_id, score=result.match_score, posted=posted)
+
+    @client.on(events.NewMessage(chats=source_entities))
+    async def handler(event):
+        text = (event.message.message or "").strip()
+        await process_message(event.chat_id, event.id, text, _chat_title(event), source="live")
+
+    backfill_hours = int(os.environ.get("BACKFILL_HOURS", "0"))
+    if backfill_hours > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=backfill_hours)
+        log.info("Backfill: scanning last %d hours from each source", backfill_hours)
+        for entity in source_entities:
+            title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(getattr(entity, "id", "?"))
+            chat_id = utils.get_peer_id(entity)
+            count = 0
+            async for msg in client.iter_messages(entity, limit=200):
+                if msg.date and msg.date < cutoff:
+                    break
+                text = (msg.message or "").strip()
+                await process_message(chat_id, msg.id, text, title, source="backfill")
+                count += 1
+            log.info("Backfill done for %s (id=%s): %d messages scanned", title, chat_id, count)
+        log.info("Backfill complete.")
 
     log.info("Listening. Ctrl+C to stop.")
     try:
