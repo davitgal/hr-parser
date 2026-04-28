@@ -142,6 +142,48 @@ class Storage:
             })
         return out
 
+    def list_messages(
+        self,
+        *,
+        filter_type: str = "all",
+        channel_id: int | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        where = ["1=1"]
+        params: list = []
+        if filter_type == "vacancies":
+            where.append("s.is_vacancy = 1")
+        elif filter_type == "not_vacancies":
+            where.append("s.is_vacancy = 0")
+        elif filter_type == "posted":
+            where.append("s.posted = 1")
+        if channel_id is not None:
+            where.append("s.chat_id = ?")
+            params.append(channel_id)
+        params.append(limit)
+        sql = f"""
+            SELECT s.ts, s.chat_id, c.username, c.title, s.title, s.score, s.is_vacancy, s.posted, s.msg_id
+            FROM seen s LEFT JOIN channels c ON c.chat_id = s.chat_id
+            WHERE {" AND ".join(where)}
+            ORDER BY s.ts DESC
+            LIMIT ?
+        """
+        rows = self._conn.execute(sql, params).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "ts": r[0],
+                "chat_id": r[1],
+                "channel_username": r[2],
+                "channel_title": r[3],
+                "title": r[4],
+                "score": r[5],
+                "is_vacancy": None if r[6] is None else bool(r[6]),
+                "posted": bool(r[7]),
+                "msg_id": r[8],
+            })
+        return out
+
     def recent_matches(self, limit: int = 20) -> list[dict]:
         rows = self._conn.execute(
             """

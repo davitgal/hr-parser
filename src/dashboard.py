@@ -4,6 +4,7 @@ import html
 import logging
 import os
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 from aiohttp import web
 
@@ -11,17 +12,23 @@ from .storage import Storage
 
 log = logging.getLogger("hr-parser.dashboard")
 
+FILTER_LABELS = {
+    "all": "All messages",
+    "vacancies": "Vacancies",
+    "not_vacancies": "Not vacancies",
+    "posted": "Posted matches",
+}
+
 
 def _fmt_ts(ts: int | None) -> str:
     if not ts:
         return "—"
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _channel_label(c: dict) -> str:
-    title = c.get("title") or "?"
-    username = c.get("username")
+    title = c.get("title") or c.get("channel_title") or "?"
+    username = c.get("username") or c.get("channel_username")
     if username:
         return f"{title} (@{username})"
     return title
@@ -36,15 +43,62 @@ def _source_link(chat_id: int | None, msg_id: int | None) -> str | None:
     return None
 
 
-def _render(overall: dict, channels: list[dict], matches: list[dict], threshold: int) -> str:
+def _qs(token: str, **params) -> str:
+    q = {k: v for k, v in params.items() if v is not None and v != ""}
+    if token:
+        q["token"] = token
+    return ("?" + urlencode(q)) if q else ""
+
+
+_BASE_CSS = """
+:root {
+  --bg: #0f1115; --panel: #161a22; --border: #232936;
+  --text: #e6e9ef; --muted: #9aa3b2; --accent: #7c5cff;
+}
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+       background: var(--bg); color: var(--text); margin: 0; padding: 32px; }
+h1 { margin: 0 0 4px; font-size: 22px; }
+h2 { font-size: 16px; margin: 28px 0 12px; }
+.sub { color: var(--muted); margin-bottom: 28px; font-size: 13px; }
+.grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 32px; }
+.stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+        padding: 14px 16px; text-decoration: none; color: inherit; display: block;
+        transition: border-color .15s, transform .15s; }
+.stat:hover { border-color: var(--accent); transform: translateY(-1px); }
+.stat .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.stat .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+table { width: 100%; border-collapse: collapse; background: var(--panel);
+        border: 1px solid var(--border); border-radius: 10px; overflow: hidden; font-size: 13px; }
+th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+th { background: #1c2230; color: var(--muted); font-weight: 500; font-size: 11px;
+     text-transform: uppercase; letter-spacing: .04em; }
+tr:last-child td { border-bottom: 0; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: #1c2230; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+       border: 1px solid var(--border); color: var(--muted); }
+.tag.posted { color: #7eecbb; border-color: #2c6748; }
+.tag.vac { color: #ffd07e; border-color: #6f5022; }
+.tag.notvac { color: #9aa3b2; }
+.footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+.back { color: var(--muted); font-size: 13px; margin-bottom: 16px; display: inline-block; }
+"""
+
+
+def _render_index(overall: dict, channels: list[dict], matches: list[dict], threshold: int, token: str) -> str:
     rows_channels = []
     for c in channels:
         label = html.escape(_channel_label(c))
         avg = c["avg_score"] if c["avg_score"] is not None else "—"
         last = _fmt_ts(c["last_msg_ts"])
+        href = "/list" + _qs(token, channel=c["chat_id"])
         rows_channels.append(
-            f"<tr>"
-            f"<td>{label}</td>"
+            f"<tr class='clickable' onclick=\"location.href='{href}'\">"
+            f"<td><a href='{href}'>{label}</a></td>"
             f"<td class='num'>{c['total']}</td>"
             f"<td class='num'>{c['vacancies']}</td>"
             f"<td class='num'>{c['posted']}</td>"
@@ -63,60 +117,34 @@ def _render(overall: dict, channels: list[dict], matches: list[dict], threshold:
         ts = _fmt_ts(m["ts"])
         title_cell = f"<a href='{link}' target='_blank'>{title}</a>" if link else title
         rows_matches.append(
-            f"<tr>"
-            f"<td>{ts}</td>"
-            f"<td>{chan}</td>"
-            f"<td>{title_cell}</td>"
-            f"<td class='num'>{m['score']}</td>"
-            f"</tr>"
+            f"<tr><td>{ts}</td><td>{chan}</td><td>{title_cell}</td><td class='num'>{m['score']}</td></tr>"
         )
     matches_html = "\n".join(rows_matches) or "<tr><td colspan='4'>no matches yet</td></tr>"
 
     last_overall = _fmt_ts(overall["last_ts"])
 
+    def card(label: str, value: int, ftype: str | None) -> str:
+        href = "/list" + _qs(token, type=ftype) if ftype else "#"
+        tag = "a" if ftype else "div"
+        return (
+            f"<{tag} class='stat' href='{href}'>"
+            f"<div class='label'>{label}</div><div class='value'>{value}</div></{tag}>"
+        )
+
     return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Victoria — HR matcher dashboard</title>
-<style>
-  :root {{
-    --bg: #0f1115; --panel: #161a22; --border: #232936;
-    --text: #e6e9ef; --muted: #9aa3b2; --accent: #7c5cff;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-         background: var(--bg); color: var(--text); margin: 0; padding: 32px; }}
-  h1 {{ margin: 0 0 4px; font-size: 22px; }}
-  .sub {{ color: var(--muted); margin-bottom: 28px; font-size: 13px; }}
-  .grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 32px; }}
-  .stat {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }}
-  .stat .label {{ color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }}
-  .stat .value {{ font-size: 22px; font-weight: 600; margin-top: 4px; }}
-  h2 {{ font-size: 16px; margin: 28px 0 12px; }}
-  table {{ width: 100%; border-collapse: collapse; background: var(--panel);
-           border: 1px solid var(--border); border-radius: 10px; overflow: hidden; font-size: 13px; }}
-  th, td {{ padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--border); }}
-  th {{ background: #1c2230; color: var(--muted); font-weight: 500; font-size: 11px;
-        text-transform: uppercase; letter-spacing: .04em; }}
-  tr:last-child td {{ border-bottom: 0; }}
-  .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  a {{ color: var(--accent); text-decoration: none; }}
-  a:hover {{ text-decoration: underline; }}
-  .footer {{ color: var(--muted); font-size: 12px; margin-top: 24px; }}
-</style>
-</head>
+<title>Victoria — HR matcher</title><style>{_BASE_CSS}</style></head>
 <body>
   <h1>Victoria — HR matcher</h1>
   <div class="sub">threshold = {threshold} · last activity {last_overall}</div>
 
   <div class="grid">
-    <div class="stat"><div class="label">Total seen</div><div class="value">{overall['total']}</div></div>
-    <div class="stat"><div class="label">Vacancies</div><div class="value">{overall['vacancies']}</div></div>
-    <div class="stat"><div class="label">Not vacancies</div><div class="value">{overall['not_vacancies']}</div></div>
-    <div class="stat"><div class="label">Posted (matched)</div><div class="value">{overall['posted']}</div></div>
-    <div class="stat"><div class="label">Channels tracked</div><div class="value">{len(channels)}</div></div>
+    {card("Total seen", overall['total'], "all")}
+    {card("Vacancies", overall['vacancies'], "vacancies")}
+    {card("Not vacancies", overall['not_vacancies'], "not_vacancies")}
+    {card("Posted (matched)", overall['posted'], "posted")}
+    {card("Channels tracked", len(channels), None)}
   </div>
 
   <h2>Per-channel stats</h2>
@@ -136,19 +164,95 @@ def _render(overall: dict, channels: list[dict], matches: list[dict], threshold:
     <tbody>{matches_html}</tbody>
   </table>
 
-  <div class="footer">Refresh the page to update.</div>
-</body>
-</html>"""
+  <div class="footer">Click any card or channel row to drill down.</div>
+</body></html>"""
+
+
+def _render_list(rows: list[dict], filter_type: str, channel_id: int | None,
+                 channel_label: str | None, token: str) -> str:
+    parts = []
+    if channel_label:
+        parts.append(html.escape(channel_label))
+    parts.append(FILTER_LABELS.get(filter_type, "All messages"))
+    title_str = " · ".join(parts)
+
+    body_rows = []
+    for r in rows:
+        ts = _fmt_ts(r["ts"])
+        chan = html.escape(_channel_label(r))
+        link = _source_link(r["chat_id"], r["msg_id"])
+        post_link = f"<a href='{link}' target='_blank'>open ↗</a>" if link else "—"
+        title = html.escape(r["title"] or "—")
+        score = r["score"] if r["score"] is not None else "—"
+        tags = []
+        if r["posted"]:
+            tags.append("<span class='tag posted'>posted</span>")
+        if r["is_vacancy"] is True:
+            tags.append("<span class='tag vac'>vacancy</span>")
+        elif r["is_vacancy"] is False:
+            tags.append("<span class='tag notvac'>not vacancy</span>")
+        tags_html = " ".join(tags) or "—"
+        body_rows.append(
+            f"<tr><td>{ts}</td><td>{chan}</td><td>{title}</td>"
+            f"<td class='num'>{score}</td><td>{tags_html}</td><td>{post_link}</td></tr>"
+        )
+    body_html = "\n".join(body_rows) or "<tr><td colspan='6'>no data</td></tr>"
+
+    back_href = "/" + _qs(token)
+
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title_str)} — Victoria</title><style>{_BASE_CSS}</style></head>
+<body>
+  <a href="{back_href}" class="back">← back to dashboard</a>
+  <h1>{html.escape(title_str)}</h1>
+  <div class="sub">{len(rows)} rows · click "open ↗" to view the original Telegram post</div>
+
+  <table>
+    <thead><tr>
+      <th>Time</th><th>Channel</th><th>Title</th>
+      <th class="num">Score</th><th>Tags</th><th>Source</th>
+    </tr></thead>
+    <tbody>{body_html}</tbody>
+  </table>
+</body></html>"""
 
 
 def make_app(storage: Storage, threshold: int, token: str) -> web.Application:
-    async def index(request: web.Request) -> web.Response:
+    def _check(request: web.Request) -> web.Response | None:
         if token and request.query.get("token") != token:
             return web.Response(text="unauthorized", status=401)
-        overall = storage.overall_stats()
-        channels = storage.channel_stats()
-        matches = storage.recent_matches(limit=30)
-        body = _render(overall, channels, matches, threshold)
+        return None
+
+    async def index(request: web.Request) -> web.Response:
+        if (resp := _check(request)) is not None:
+            return resp
+        body = _render_index(
+            storage.overall_stats(),
+            storage.channel_stats(),
+            storage.recent_matches(limit=30),
+            threshold,
+            token,
+        )
+        return web.Response(text=body, content_type="text/html")
+
+    async def list_view(request: web.Request) -> web.Response:
+        if (resp := _check(request)) is not None:
+            return resp
+        ftype = request.query.get("type", "all")
+        if ftype not in FILTER_LABELS:
+            ftype = "all"
+        channel_id_raw = request.query.get("channel")
+        channel_id = int(channel_id_raw) if channel_id_raw and channel_id_raw.lstrip("-").isdigit() else None
+        channel_label = None
+        if channel_id is not None:
+            for c in storage.channel_stats():
+                if c["chat_id"] == channel_id:
+                    channel_label = _channel_label(c)
+                    break
+        rows = storage.list_messages(filter_type=ftype, channel_id=channel_id, limit=300)
+        body = _render_list(rows, ftype, channel_id, channel_label, token)
         return web.Response(text=body, content_type="text/html")
 
     async def health(request: web.Request) -> web.Response:
@@ -156,6 +260,7 @@ def make_app(storage: Storage, threshold: int, token: str) -> web.Application:
 
     app = web.Application()
     app.router.add_get("/", index)
+    app.router.add_get("/list", list_view)
     app.router.add_get("/health", health)
     return app
 
@@ -167,7 +272,7 @@ async def start_dashboard(storage: Storage, threshold: int) -> None:
         return
     token = os.environ.get("DASHBOARD_TOKEN", "")
     if not token:
-        log.warning("DASHBOARD_TOKEN not set — dashboard is publicly accessible. Set the env var to require ?token=...")
+        log.warning("DASHBOARD_TOKEN not set — dashboard is publicly accessible.")
     app = make_app(storage, threshold, token)
     runner = web.AppRunner(app)
     await runner.setup()
