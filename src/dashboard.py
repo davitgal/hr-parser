@@ -86,7 +86,27 @@ a:hover { text-decoration: underline; }
 .tag.notvac { color: #9aa3b2; }
 .footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
 .back { color: var(--muted); font-size: 13px; margin-bottom: 16px; display: inline-block; }
-"""
+
+.backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+            opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 100; }
+.backdrop.open { opacity: 1; pointer-events: auto; }
+.drawer { position: fixed; top: 0; right: 0; height: 100vh;
+          width: min(960px, 92vw); background: var(--bg);
+          border-left: 1px solid var(--border); transform: translateX(100%);
+          transition: transform .22s ease-out; z-index: 101;
+          overflow-y: auto; box-shadow: -8px 0 24px rgba(0,0,0,0.4); }
+.drawer.open { transform: translateX(0); }
+.drawer-header { position: sticky; top: 0; background: var(--bg);
+                 padding: 16px 24px; border-bottom: 1px solid var(--border);
+                 display: flex; justify-content: space-between; align-items: center;
+                 z-index: 1; }
+.drawer-header h2 { margin: 0; font-size: 14px; color: var(--muted); font-weight: 500;
+                    text-transform: uppercase; letter-spacing: .04em; }
+.drawer-close { background: transparent; border: 1px solid var(--border); color: var(--text);
+                padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.drawer-close:hover { border-color: var(--accent); }
+.drawer-body { padding: 20px 24px; }
+.drawer-body h1 { font-size: 18px; margin-bottom: 4px; }"""
 
 
 def _render_index(overall: dict, channels: list[dict], matches: list[dict], threshold: int, token: str) -> str:
@@ -97,8 +117,8 @@ def _render_index(overall: dict, channels: list[dict], matches: list[dict], thre
         last = _fmt_ts(c["last_msg_ts"])
         href = "/list" + _qs(token, channel=c["chat_id"])
         rows_channels.append(
-            f"<tr class='clickable' onclick=\"location.href='{href}'\">"
-            f"<td><a href='{href}'>{label}</a></td>"
+            f"<tr class='clickable' data-drawer='{href}' onclick=\"location.href='{href}'\">"
+            f"<td>{label}</td>"
             f"<td class='num'>{c['total']}</td>"
             f"<td class='num'>{c['vacancies']}</td>"
             f"<td class='num'>{c['posted']}</td>"
@@ -124,11 +144,15 @@ def _render_index(overall: dict, channels: list[dict], matches: list[dict], thre
     last_overall = _fmt_ts(overall["last_ts"])
 
     def card(label: str, value: int, ftype: str | None) -> str:
-        href = "/list" + _qs(token, type=ftype) if ftype else "#"
-        tag = "a" if ftype else "div"
+        if ftype:
+            href = "/list" + _qs(token, type=ftype)
+            return (
+                f"<a class='stat' href='{href}' data-drawer='{href}'>"
+                f"<div class='label'>{label}</div><div class='value'>{value}</div></a>"
+            )
         return (
-            f"<{tag} class='stat' href='{href}'>"
-            f"<div class='label'>{label}</div><div class='value'>{value}</div></{tag}>"
+            f"<div class='stat'>"
+            f"<div class='label'>{label}</div><div class='value'>{value}</div></div>"
         )
 
     return f"""<!doctype html>
@@ -165,23 +189,63 @@ def _render_index(overall: dict, channels: list[dict], matches: list[dict], thre
   </table>
 
   <div class="footer">Click any card or channel row to drill down.</div>
+
+  <div class="backdrop" id="backdrop"></div>
+  <aside class="drawer" id="drawer" aria-hidden="true">
+    <div class="drawer-header">
+      <h2 id="drawer-title">Details</h2>
+      <button class="drawer-close" id="drawer-close">close · esc</button>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+
+  <script>
+    (function() {{
+      const drawer = document.getElementById('drawer');
+      const backdrop = document.getElementById('backdrop');
+      const body = document.getElementById('drawer-body');
+      const closeBtn = document.getElementById('drawer-close');
+
+      function open(href) {{
+        const url = href + (href.includes('?') ? '&' : '?') + 'fragment=1';
+        body.innerHTML = '<div style="color:#9aa3b2">Loading…</div>';
+        drawer.classList.add('open');
+        backdrop.classList.add('open');
+        drawer.setAttribute('aria-hidden', 'false');
+        fetch(url, {{credentials: 'same-origin'}}).then(r => {{
+          if (!r.ok) throw new Error('http ' + r.status);
+          return r.text();
+        }}).then(html => {{ body.innerHTML = html; }})
+          .catch(e => {{ body.innerHTML = '<div style="color:#ff8888">Error: ' + e.message + '</div>'; }});
+      }}
+      function close() {{
+        drawer.classList.remove('open');
+        backdrop.classList.remove('open');
+        drawer.setAttribute('aria-hidden', 'true');
+      }}
+      document.querySelectorAll('[data-drawer]').forEach(el => {{
+        el.addEventListener('click', e => {{
+          if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+          e.preventDefault();
+          e.stopPropagation();
+          open(el.dataset.drawer);
+        }});
+      }});
+      backdrop.addEventListener('click', close);
+      closeBtn.addEventListener('click', close);
+      document.addEventListener('keydown', e => {{ if (e.key === 'Escape') close(); }});
+    }})();
+  </script>
 </body></html>"""
 
 
-def _render_list(rows: list[dict], filter_type: str, channel_id: int | None,
-                 channel_label: str | None, token: str) -> str:
-    parts = []
-    if channel_label:
-        parts.append(html.escape(channel_label))
-    parts.append(FILTER_LABELS.get(filter_type, "All messages"))
-    title_str = " · ".join(parts)
-
+def _render_list_inner(rows: list[dict], title_str: str) -> str:
     body_rows = []
     for r in rows:
         ts = _fmt_ts(r["ts"])
         chan = html.escape(_channel_label(r))
         link = _source_link(r["chat_id"], r["msg_id"])
-        post_link = f"<a href='{link}' target='_blank'>open ↗</a>" if link else "—"
+        post_link = f"<a href='{link}' target='_blank' rel='noopener'>open ↗</a>" if link else "—"
         title = html.escape(r["title"] or "—")
         score = r["score"] if r["score"] is not None else "—"
         tags = []
@@ -198,24 +262,37 @@ def _render_list(rows: list[dict], filter_type: str, channel_id: int | None,
         )
     body_html = "\n".join(body_rows) or "<tr><td colspan='6'>no data</td></tr>"
 
-    back_href = "/" + _qs(token)
-
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title_str)} — Victoria</title><style>{_BASE_CSS}</style></head>
-<body>
-  <a href="{back_href}" class="back">← back to dashboard</a>
+    return f"""
   <h1>{html.escape(title_str)}</h1>
   <div class="sub">{len(rows)} rows · click "open ↗" to view the original Telegram post</div>
-
   <table>
     <thead><tr>
       <th>Time</th><th>Channel</th><th>Title</th>
       <th class="num">Score</th><th>Tags</th><th>Source</th>
     </tr></thead>
     <tbody>{body_html}</tbody>
-  </table>
+  </table>"""
+
+
+def _list_title(filter_type: str, channel_label: str | None) -> str:
+    parts = []
+    if channel_label:
+        parts.append(channel_label)
+    parts.append(FILTER_LABELS.get(filter_type, "All messages"))
+    return " · ".join(parts)
+
+
+def _render_list_page(rows: list[dict], filter_type: str, channel_label: str | None, token: str) -> str:
+    title_str = _list_title(filter_type, channel_label)
+    inner = _render_list_inner(rows, title_str)
+    back_href = "/" + _qs(token)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title_str)} — Victoria</title><style>{_BASE_CSS}</style></head>
+<body>
+  <a href="{back_href}" class="back">← back to dashboard</a>
+  {inner}
 </body></html>"""
 
 
@@ -252,7 +329,10 @@ def make_app(storage: Storage, threshold: int, token: str) -> web.Application:
                     channel_label = _channel_label(c)
                     break
         rows = storage.list_messages(filter_type=ftype, channel_id=channel_id, limit=300)
-        body = _render_list(rows, ftype, channel_id, channel_label, token)
+        if request.query.get("fragment"):
+            body = _render_list_inner(rows, _list_title(ftype, channel_label))
+        else:
+            body = _render_list_page(rows, ftype, channel_label, token)
         return web.Response(text=body, content_type="text/html")
 
     async def health(request: web.Request) -> web.Response:
