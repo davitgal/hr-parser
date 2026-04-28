@@ -117,7 +117,7 @@ def _render_index(overall: dict, channels: list[dict], matches: list[dict], thre
         last = _fmt_ts(c["last_msg_ts"])
         href = "/list" + _qs(token, channel=c["chat_id"])
         rows_channels.append(
-            f"<tr class='clickable' data-drawer='{href}' onclick=\"location.href='{href}'\">"
+            f"<tr class='clickable' data-drawer='{href}'>"
             f"<td>{label}</td>"
             f"<td class='num'>{c['total']}</td>"
             f"<td class='num'>{c['vacancies']}</td>"
@@ -225,7 +225,13 @@ def _render_index(overall: dict, channels: list[dict], matches: list[dict], thre
       }}
       document.querySelectorAll('[data-drawer]').forEach(el => {{
         el.addEventListener('click', e => {{
-          if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+          if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) {{
+            if (el.tagName !== 'A') {{
+              window.open(el.dataset.drawer, '_blank');
+              e.preventDefault();
+            }}
+            return;
+          }}
           e.preventDefault();
           e.stopPropagation();
           open(el.dataset.drawer);
